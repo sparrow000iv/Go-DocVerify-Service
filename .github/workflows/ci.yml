@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.23"
+
+jobs:
+  # ---------------------------------------------------------------- lint ----
+  lint:
+    name: Vet and Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Verify gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-formatted:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: latest
+          install-go: false
+
+  # ---------------------------------------------------------- unit tests ----
+  unit-tests:
+    name: Unit Tests and Race Detector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run unit tests with race detector
+        run: go test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./internal/...
+
+      - name: Enforce coverage threshold
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print substr($3, 1, length($3)-1)}')
+          echo "Total coverage: ${total}%"
+          if (( $(echo "${total} < 70" | bc -l) )); then
+            echo "Coverage ${total}% is below the 70% threshold"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  # --------------------------------------------------- integration tests ----
+  integration-tests:
+    name: Ginkgo Integration Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install Ginkgo CLI
+        run: go install github.com/onsi/ginkgo/v2/ginkgo@v2.22.0
+
+      - name: Run Ginkgo suite
+        run: ginkgo -r --race --randomize-all --fail-on-pending --keep-going ./test/...
+
+  # --------------------------------------------------------- benchmarks ----
+  benchmarks:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run benchmarks
+        run: go test -bench=. -benchmem -run='^$' ./internal/store/ | tee bench.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: bench.txt
+
+  # -------------------------------------------------------- docker build ----
+  docker:
+    name: Build Container Image
+    runs-on: ubuntu-latest
+    needs: [lint, unit-tests, integration-tests]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: docverify:${{ github.sha }}
+          build-args: VERSION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the image
+        run: |
+          docker run -d --name dv -p 8080:8080 docverify:${{ github.sha }}
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/healthz > /dev/null; then
+              echo "Service is healthy"; break
+            fi
+            sleep 1
+          done
+          curl -fsS http://localhost:8080/healthz
+          curl -fsS http://localhost:8080/metrics | grep docverify_http_requests_total
+          docker rm -f dv
+
+  # ----------------------------------------------------- k8s deployment ----
+  k8s-deploy:
+    name: Deploy to kind and Verify
+    runs-on: ubuntu-latest
+    needs: [docker]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: docverify
+          config: deploy/kind-cluster.yaml
+
+      - name: Build and load image into kind
+        run: |
+          docker build -t docverify:local .
+          kind load docker-image docverify:local --name docverify
+
+      - name: Apply manifests
+        run: kubectl apply -f deploy/k8s/
+
+      - name: Wait for rollout
+        run: kubectl rollout status deployment/docverify --timeout=120s
+
+      - name: Verify endpoints through the cluster
+        run: |
+          kubectl wait --for=condition=ready pod -l app=docverify --timeout=120s
+          kubectl port-forward svc/docverify 8080:8080 &
+          sleep 5
+          curl -fsS http://localhost:8080/healthz
+          curl -fsS -X POST http://localhost:8080/api/v1/documents \
+            -H 'Content-Type: application/json' \
+            -d '{"owner":"ci","doc_type":"passport","content":"payload"}'
+          curl -fsS http://localhost:8080/metrics | grep docverify_
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide
+          kubectl describe deployment docverify
+          kubectl logs -l app=docverify --tail=101
