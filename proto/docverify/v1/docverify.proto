@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package docverify.v1;
+
+option go_package = "github.com/sparrow000iv/go-docverify-service/proto/docverify/v1;docverifyv1";
+
+// DocVerify exposes document verification operations over gRPC.
+// The same domain logic is served over REST by the HTTP API.
+service DocVerify {
+  // Submit queues a document for verification and returns its record.
+  rpc Submit(SubmitRequest) returns (Document);
+  // Get returns a single document by id.
+  rpc Get(GetRequest) returns (Document);
+  // List returns documents, optionally filtered by status.
+  rpc List(ListRequest) returns (ListResponse);
+  // Verify runs the verification scoring routine on a stored document.
+  rpc Verify(VerifyRequest) returns (Document);
+  // Delete removes a document by id.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_PENDING = 1;
+  STATUS_VERIFIED = 2;
+  STATUS_REJECTED = 3;
+}
+
+message Document {
+  string id = 1;
+  string owner = 2;
+  string doc_type = 3;
+  Status status = 4;
+  double score = 5;
+  string created_at = 6;
+  string updated_at = 7;
+}
+
+message SubmitRequest {
+  string owner = 1;
+  string doc_type = 2;
+  // Raw payload stand-in; scored deterministically by the verifier.
+  string content = 3;
+}
+
+message GetRequest {
+  string id = 1;
+}
+
+message ListRequest {
+  Status status_filter = 1;
+  int32 limit = 2;
+}
+
+message ListResponse {
+  repeated Document documents = 1;
+  int32 total = 2;
+}
+
+message VerifyRequest {
+  string id = 1;
+}
+
+message DeleteRequest {
+  string id = 1;
+}
+
+message DeleteResponse {
+  bool deleted = 1;
+}
